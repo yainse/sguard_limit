@@ -2,11 +2,15 @@
 #include <Windows.h>
 #include <vector>
 #include <string>
+#include <atomic>
+#include <memory>
 
 
 // system version (kdriver support)
 enum class OSVersion { 
 	WIN_7       = 1, 
+	WIN_8,
+	WIN_81,
 	WIN_10_11,
 	OTHERS
 };
@@ -81,9 +85,9 @@ public:
 
 public:
 	bool       systemInit(HINSTANCE hInstance);
+	bool       runWithUac();
 	void       setupProcessDpi();
-	void       enableDebugPrivilege();
-	bool       checkDebugPrivilege();
+	bool       enableDebugPrivilege();
 	bool       createWindow(WNDPROC WndProc, DWORD WndIcon);
 	void       createTray(UINT trayActiveMsg);
 	void       removeTray();
@@ -96,32 +100,60 @@ public:
 	void       panic(DWORD errorCode, const char* format, ...);
 	
 public:
-	const std::string&  getProfileDir();     // xref: config, kdriver
-	OSVersion           getSystemVersion();  // xref: mempatch
-	DWORD               getSystemBuildNum(); // xref: mempatch
+	std::string   getProfileDir();     // xref: config, kdriver
+	OSVersion     getSystemVersion();  // xref: mempatch
+	DWORD         getSystemBuildNum(); // xref: mempatch
 
-public:
-	void       raiseCleanThread(); // util: get rid of GameLoader.exe
 
 private:
-	ATOM     _registerMyClass(WNDPROC WndProc, DWORD iconRcNum);
-	void     _log(DWORD code, const char* logbuf);
-	void     _panic(DWORD code, const char* showbuf);
+	ATOM       _registerMyClass(WNDPROC WndProc, DWORD iconRcNum);
+	void       _log(DWORD code, const char* logbuf);
+	void       _panic(DWORD code, const char* showbuf);
 
 
 public:
-	HINSTANCE           hInstance;
+	bool       modifyStartupReg();  // add/remove registry based on autoStartup
+	void       raiseCleanThread();  // clean GameLoader as game started
+
+
+public:
+	
+	struct BanInfo {
+		using str = std::string;
+		str qq, id, detail;
+		BanInfo(str qq, str id, str detail) : qq(qq), id(id), detail(detail) {}
+	};
+
+	std::atomic<bool>      cloudDataReady;
+	std::string            cloudVersion;
+	std::string            cloudVersionDetail;
+	std::string            cloudUpdateLink;
+	std::string            cloudShowNotice;
+	std::vector<BanInfo>   cloudBanList;
+
+	void       dieIfBlocked(const std::vector<BanInfo>& list);
 
 private:
-	HANDLE              hProgram;
-	HWND                hWnd;
+	void       _grabCloudData();
+	void       _unexpectedCipFailure();
 
-	OSVersion           osVersion;
-	DWORD               osBuildNum;
-	
-	FILE*               logfp;
-	
-	NOTIFYICONDATA      icon;
-	
-	std::string         profileDir;
+
+public:
+	bool                   autoStartup;
+	bool                   autoCheckUpdate;
+	bool                   killAceLoader;
+
+public:
+	HINSTANCE              hInstance;
+	HWND                   hWnd;
+
+private:
+	HANDLE                 hProgram;
+
+	std::string            profileDir;
+	OSVersion              osVersion;
+	DWORD                  osBuildNum;
+
+	FILE*                  logfp;
+	NOTIFYICONDATA         icon;
 };

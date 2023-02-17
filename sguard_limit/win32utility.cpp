@@ -1,12 +1,12 @@
 #include <Windows.h>
+#include <Shlobj.h>
 #include <tlhelp32.h>
-#include <UserEnv.h>
+#include <wininet.h>
 #include <time.h>
 #include <thread>
-#include <mutex>
+#include <filesystem>
+#include <cjson/cJSON.h>
 #include "win32utility.h"
-
-// dependency: Userenv.lib
 
 
 // win32Thread
@@ -82,7 +82,7 @@ DWORD win32ThreadManager::getTargetPid(const char* procName) {  // ret == 0 if n
 }
 
 bool win32ThreadManager::killTarget() { // kill process: return true if killed.
-	
+
 	if (pid == 0) {
 		return false;
 	}
@@ -145,8 +145,12 @@ bool win32ThreadManager::enumTargetThread(DWORD desiredAccess) { // => threadLis
 win32SystemManager win32SystemManager::systemManager;
 
 win32SystemManager::win32SystemManager() 
-	: hWnd(NULL), hInstance(NULL),
-	  hProgram(NULL), osVersion(OSVersion::OTHERS), osBuildNum(19043), logfp(NULL), icon{}, profileDir{} {}
+	: cloudDataReady(false), cloudVersion{}, cloudVersionDetail{},
+	  cloudUpdateLink{}, cloudShowNotice{}, cloudBanList{},
+	  autoStartup(false), autoCheckUpdate(false), killAceLoader(true), 
+	  hInstance(NULL), hWnd(NULL), hProgram(NULL),
+	  profileDir{}, osVersion(OSVersion::OTHERS), osBuildNum(0), 
+	  logfp(NULL), icon{} {}
 
 win32SystemManager::~win32SystemManager() {
 
@@ -155,12 +159,34 @@ win32SystemManager::~win32SystemManager() {
 	}
 
 	if (hProgram) {
-		CloseHandle(hProgram);
+		ReleaseMutex(hProgram);
 	}
 }
 
 win32SystemManager& win32SystemManager::getInstance() {
 	return systemManager;
+}
+
+bool win32SystemManager::runWithUac() {
+
+	if (!IsUserAnAdmin()) {
+
+		char    path        [0x1000];
+		DWORD   errorCode   = 0;
+
+		GetModuleFileName(NULL, path, 0x1000);
+		errorCode = (DWORD)(INT_PTR)
+		ShellExecute(NULL, "runas", path, NULL /* no cmdline here */, NULL, SW_SHOWNORMAL);
+		
+		if (errorCode <= 32) {
+			panic(errorCode, "无法以uac权限启动，路径中是否包含特殊符号？");
+		}
+
+		return false;
+	
+	} else {
+		return true;
+	}
 }
 
 void win32SystemManager::setupProcessDpi() {
@@ -176,13 +202,7 @@ void win32SystemManager::setupProcessDpi() {
 			SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED);
 		
 		} else {
-			
-			typedef BOOL(WINAPI* fp2)();
-			fp2 SetProcessDPIAware = (fp2)GetProcAddress(hUser32, "SetProcessDPIAware");
-
-			if (SetProcessDPIAware) {
-				SetProcessDPIAware();
-			}
+			SetProcessDPIAware();
 		}
 
 		FreeLibrary(hUser32);
@@ -191,7 +211,7 @@ void win32SystemManager::setupProcessDpi() {
 
 bool win32SystemManager::systemInit(HINSTANCE hInstance) {
 
-	this->hInstance      = hInstance;
+	this->hInstance = hInstance;
 
 
 	// decide whether it's single instance.
@@ -203,27 +223,23 @@ bool win32SystemManager::systemInit(HINSTANCE hInstance) {
 
 
 	// initialize path vars.
-	HANDLE       hToken;
-	CHAR         buf         [1024];
-	DWORD        size        = 1024;
-
-	OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken);
-	GetUserProfileDirectory(hToken, buf, &size);
-	CloseHandle(hToken);
-
-	profileDir = std::string(buf) + "\\AppData\\Roaming\\sguard_limit";
+	char profilePath[0x1000] = {};
+	if (ExpandEnvironmentStrings("%appdata%\\sguard_limit", profilePath, 0x1000)) {
+		profileDir = profilePath;
+	} else {
+		panic("获取系统用户目录失败。");
+		return false;
+	}
 
 
 	// initialize profile directory.
-	DWORD pathAttr = GetFileAttributes(profileDir.c_str());
-	if ((pathAttr == INVALID_FILE_ATTRIBUTES) || !(pathAttr & FILE_ATTRIBUTE_DIRECTORY)) {
-		if (!CreateDirectory(profileDir.c_str(), NULL)) {
-			// if create dir failed (dir contains special chars), redirect to
-			profileDir = "C:\\sguard_limit";
-			pathAttr = GetFileAttributes(profileDir.c_str());
-			if ((pathAttr == INVALID_FILE_ATTRIBUTES) || !(pathAttr & FILE_ATTRIBUTE_DIRECTORY)) {
-				if (!CreateDirectory(profileDir.c_str(), NULL)) {
-					panic("目录%s创建失败。", profileDir.c_str());
+	std::error_code ec;
+
+	if (!std::filesystem::is_directory(profileDir, ec)) {
+		if (!std::filesystem::create_directory(profileDir, ec)) {
+			if (!std::filesystem::is_directory(profileDir = "C:\\sguard_limit", ec)) {
+				if (!std::filesystem::create_directory(profileDir, ec)) {
+					panic(ec.value(), "创建用户数据目录失败。");
 					return false;
 				}
 			}
@@ -232,17 +248,17 @@ bool win32SystemManager::systemInit(HINSTANCE hInstance) {
 
 
 	// initialize log subsystem.
-	auto      logfile       = profileDir + "\\log.txt";
-	DWORD     logfileSize   = GetCompressedFileSize(logfile.c_str(), NULL);
+	auto      logfile = profileDir + "\\log.txt";
+	DWORD     logfileSize = GetCompressedFileSize(logfile.c_str(), NULL);
 
-	if (logfileSize != INVALID_FILE_SIZE && logfileSize > (1 << 18)) { // 256KB
+	if (logfileSize != INVALID_FILE_SIZE && logfileSize > (1 << 15)) { // 32KB
 		DeleteFile(logfile.c_str());
 	}
 
 	logfp = fopen(logfile.c_str(), "a+");
 
 	if (!logfp) {
-		panic("打开log文件%s失败。", logfile.c_str());
+		panic("打开log文件失败。");
 		return false;
 	}
 
@@ -256,9 +272,7 @@ bool win32SystemManager::systemInit(HINSTANCE hInstance) {
 
 	// acquire system version.
 	// ntdll is loaded for sure, and we don't need to (neither cannot) free it.
-	HMODULE hNtdll = GetModuleHandle("ntdll.dll");
-
-	if (hNtdll) {
+	if (auto hNtdll = GetModuleHandle("Ntdll.dll")) {
 
 		typedef NTSTATUS(WINAPI* pf)(OSVERSIONINFOEX*);
 		pf RtlGetVersion = (pf)GetProcAddress(hNtdll, "RtlGetVersion");
@@ -274,66 +288,57 @@ bool win32SystemManager::systemInit(HINSTANCE hInstance) {
 				osVersion = OSVersion::WIN_10_11;  // NT 10.0
 			} else if (osInfo.dwMajorVersion == 6 && osInfo.dwMinorVersion == 1) {
 				osVersion = OSVersion::WIN_7;      // NT 6.1
+			} else if (osInfo.dwMajorVersion == 6 && osInfo.dwMinorVersion == 2) {
+				osVersion = OSVersion::WIN_8;      // NT 6.2
+			} else if (osInfo.dwMajorVersion == 6 && osInfo.dwMinorVersion == 3) {
+				osVersion = OSVersion::WIN_81;     // NT 6.3
 			}  // else default to:  OSVersion::OTHERS
 
 			osBuildNum = osInfo.dwBuildNumber;
+
+			log("systemInit(): Running on Windows NT %u.%u.%u",
+				osInfo.dwMajorVersion, osInfo.dwMinorVersion, osInfo.dwBuildNumber);
 		}
 	}
+
+
+	// acquire data from cloud, incluing updates etc.
+	// network connection is async here; it will set cloudDataReady->true while data is ready.
+	_grabCloudData();
+
+
+	// quick check in hard code banned list.
+	dieIfBlocked({
+		{ "133609854", "@   ", "群里有人给我发红包感谢LOL优化，被此人用脚本抢了，让他还回来就装死" },
+		{ "470458362", "@打人白菜", "此人不认可群友发言，群友就说开玩笑的，结果他直接骂对方SB然后说也是开玩笑的，我禁言他10分钟，就说我“急了”“无聊的正义感在双标”" },
+	});
 
 
 	return true;
 }
 
-void win32SystemManager::enableDebugPrivilege() {
+bool win32SystemManager::enableDebugPrivilege() {
 
 	HANDLE hToken;
-	LUID Luid;
 	TOKEN_PRIVILEGES tp;
-
-	OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken);
-
-	LookupPrivilegeValue(NULL, SE_DEBUG_NAME, &Luid);
-
 	tp.PrivilegeCount = 1;
-	tp.Privileges[0].Luid = Luid;
 	tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
 
+	// raise to debug previlege
+	OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken);
+	LookupPrivilegeValue(NULL, SE_DEBUG_NAME, &tp.Privileges[0].Luid);
 	AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), NULL, NULL);
-
-	CloseHandle(hToken);
-
-	//// 也可以用RtlAdjustPrivilege来提权： 
-	// typedef NTSTATUS (WINAPI* pf)(ULONG Privilege, BOOLEAN Enable, BOOLEAN CurrentThread, PBOOLEAN Enabled);
-	// pf RtlAdjustPrivilege = (pf)GetProcAddress(GetModuleHandle("Ntdll.dll"), "RtlAdjustPrivilege");
-	// BOOLEAN prev;
-	// int ret = RtlAdjustPrivilege(0x14, 1, 0, &prev);
-}
-
-bool win32SystemManager::checkDebugPrivilege() {
-
-	HANDLE hToken;
-	LUID luidPrivilege = { 0 };
-	PRIVILEGE_SET RequiredPrivileges = { 0 };
-	BOOL bResult = 0;
-
-	OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken);
-
-	LookupPrivilegeValue(NULL, SE_DEBUG_NAME, &luidPrivilege);
-
-	RequiredPrivileges.Control = PRIVILEGE_SET_ALL_NECESSARY;
-	RequiredPrivileges.PrivilegeCount = 1;
-	RequiredPrivileges.Privilege[0].Luid = luidPrivilege;
-	RequiredPrivileges.Privilege[0].Attributes = SE_PRIVILEGE_ENABLED;
-
-	PrivilegeCheck(hToken, &RequiredPrivileges, &bResult);
-
-	CloseHandle(hToken);
-
-	if (!bResult) {
+	
+	// check if debug previlege is acquired
+	if (GetLastError() != ERROR_SUCCESS) {
 		panic("提升权限失败，请右键管理员运行。");
+
+		CloseHandle(hToken);
+		return false;
 	}
 
-	return (bool)bResult;
+	CloseHandle(hToken);
+	return true;
 }
 
 bool win32SystemManager::createWindow(WNDPROC WndProc, DWORD WndIcon) {
@@ -389,26 +394,26 @@ void win32SystemManager::removeTray() {
 
 void win32SystemManager::log(const char* format, ...) {
 
-	CHAR logbuf[0x1000];
+	char buf[0x1000];
 
 	va_list arg;
 	va_start(arg, format);
-	vsprintf(logbuf, format, arg);
+	vsprintf(buf, format, arg);
 	va_end(arg);
 
-	_log(0, logbuf);
+	_log(0, buf);
 }
 
 void win32SystemManager::log(DWORD errorCode, const char* format, ...) {
 	
-	CHAR logbuf[0x1000];
+	char buf[0x1000];
 
 	va_list arg;
 	va_start(arg, format);
-	vsprintf(logbuf, format, arg);
+	vsprintf(buf, format, arg);
 	va_end(arg);
 
-	_log(errorCode, logbuf);
+	_log(errorCode, buf);
 }
 
 void win32SystemManager::panic(const char* format, ...) {
@@ -416,7 +421,7 @@ void win32SystemManager::panic(const char* format, ...) {
 	// call GetLastError first; to avoid errors in current function.
 	DWORD errorCode = GetLastError();
 
-	CHAR buf[0x1000];
+	char buf[0x1000];
 
 	va_list arg;
 	va_start(arg, format);
@@ -428,7 +433,7 @@ void win32SystemManager::panic(const char* format, ...) {
 
 void win32SystemManager::panic(DWORD errorCode, const char* format, ...) {
 
-	CHAR buf[0x1000];
+	char buf[0x1000];
 
 	va_list arg;
 	va_start(arg, format);
@@ -438,7 +443,7 @@ void win32SystemManager::panic(DWORD errorCode, const char* format, ...) {
 	_panic(errorCode, buf);
 }
 
-const std::string& win32SystemManager::getProfileDir() {
+std::string win32SystemManager::getProfileDir() {
 	return profileDir;
 }
 
@@ -450,57 +455,102 @@ DWORD win32SystemManager::getSystemBuildNum() {
 	return osBuildNum;
 }
 
+bool win32SystemManager::modifyStartupReg() {
+
+	HKEY   hKey;
+	bool   ret    = true;
+
+	if (RegOpenKeyEx(HKEY_CURRENT_USER, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_ALL_ACCESS, &hKey) == ERROR_SUCCESS) {
+		
+		if (autoStartup) {
+			// should auto start: create key.
+			char path[0x1000];
+			GetModuleFileName(NULL, path, 0x1000);
+			if (RegSetValueEx(hKey, "sguard_limit", 0, REG_SZ, (const BYTE*)path, (DWORD)strlen(path) + 1) != ERROR_SUCCESS) {
+				panic("modifyStartupReg(): RegSetValueEx失败。");
+				ret = false;
+			}
+		
+		} else {
+			// should not auto start: remove key.
+			// if key doesn't exist, will return fail. ignore it.
+			RegDeleteValue(hKey, "sguard_limit");
+		}
+		
+		RegCloseKey(hKey);
+
+	} else {
+		panic("modifyStartupReg(): RegOpenKeyEx失败。");
+		ret = false;
+	}
+
+	return ret;
+}
+
 void win32SystemManager::raiseCleanThread() {
 
-	std::thread cleanThread([this]() {
+	std::thread cleanThread([this] () {
 
-		// clean thread: 1 min after game starts, end "ace-loader" process.
-		// [note] former thread(s) will give up cleaning if game has re-launched.
-		static std::mutex mtx;
+		DWORD tid = GetCurrentThreadId();
 
-		mtx.lock();
-		log("clean thread: [entering] -> critical section");
+		// check if clean thread already exist. in that case exit.
+		static std::atomic<DWORD> lock = 0;
+		DWORD expected = 0;
+		
+		// [note] make atomic operation at instruction level (e.g. x86 lock cmpxchg)
+		// is more fast than sync with mutex which may trap in kernel,
+		// because cpu cache lock only affect single cache line.
+		// see: https://stackoverflow.com/questions/2538070/atomic-operation-cost
+		if (lock.compare_exchange_strong(expected, tid)) {
+			log("clean thread %u: lock acquired.", tid);
 
+		} else {
+			log("clean thread %u: lock is now held by %u, exiting.", tid, lock.load());
+			return;
+		}
+
+
+		// wait 60 secs after game start to ensure it's stable to clean.
+		// if game not exist, still wait 60 secs and make clean.
 		win32ThreadManager  threadMgr;
 		DWORD               pid            = threadMgr.getTargetPid();
 		DWORD               timeElapsed    = 0;
 		constexpr auto      timeToWait     = 60;
 
-		if (pid) {
+		while (timeElapsed < timeToWait) {
 
-			// ensure SG pid not changed before we eliminate ace-loader,
-			// here we use pid change to identify game re-launch.
-			log("clean thread: [wait] 1 min wait begin.");
+			Sleep(5000);
+			timeElapsed += 5;
 
-			do {
-				Sleep(5000);
-				timeElapsed += 5;
-			} while ( timeElapsed < timeToWait && pid == threadMgr.getTargetPid() );
+			// every 5 secs, check SGUARD instance.
+			// if one of (SG not exist || SG pid alive) keeps 60 secs, kill ace-loader.
+			auto pidNow = threadMgr.getTargetPid();
 
-			// if wait success, try kill ace-loader.
-			// [note] check pid at end to ensure kill is immediately after check.
-			// check pid won't execute twice at one time, no matter wait success or fail.
-			if (timeElapsed >= timeToWait && pid == threadMgr.getTargetPid()) {
+			// if pid changed (both pid == 0 or != 0), reset timer.
+			if (pidNow != pid) {
+				log("clean thread %u: SG pid changed to %u, reset timer.", tid, pidNow);
+				pid = pidNow;
+				timeElapsed = 0;
+			}
+		};
 
-				// there maybe multiple procs, so do a while.
-				while ( threadMgr.getTargetPid("GameLoader.exe") ) {
 
-					if (threadMgr.killTarget()) {
-						log("clean thread: [GameLoader.exe] - pid %u eliminated.", threadMgr.pid);
+		// start clean ace-loader process.
+		// there maybe multiple procs, so do a while.
+		while (threadMgr.getTargetPid("GameLoader.exe")) {
 
-					} else {
-						log(GetLastError(), "clean thread: [GameLoader.exe] - failed.");
-						break;
-					}
-				}
+			if (threadMgr.killTarget()) {
+				log("clean thread %u: eliminated GameLoader.exe - pid %u.", tid, threadMgr.pid);
 
 			} else {
-				log("clean thread: [wait] aborted: game re-launched");
+				log(GetLastError(), "clean thread %u: clean GameLoader.exe failed.", tid);
 			}
 		}
 
-		log("clean thread: [leaving] <- critical section");
-		mtx.unlock();
+
+		// release lock and exit.
+		log("clean thread %u: exit and release lock.", tid);
+		lock = 0;
 	});
 
 	cleanThread.detach();
@@ -530,7 +580,7 @@ void win32SystemManager::_log(DWORD code, const char* logbuf) {
 		return;
 	}
 
-	CHAR result[0x1000];
+	char result[0x1000];
 
 	// put timestamp to result.
 	time_t t = time(0);
@@ -549,8 +599,6 @@ void win32SystemManager::_log(DWORD code, const char* logbuf) {
 	if (code != 0) {
 
 		// put timestamp to result.
-		time_t t = time(0);
-		tm* local = localtime(&t);
 		sprintf(result, "[%d-%02d-%02d %02d:%02d:%02d]   note: error ",
 			1900 + local->tm_year, local->tm_mon + 1, local->tm_mday, local->tm_hour, local->tm_min, local->tm_sec);
 
@@ -570,7 +618,7 @@ void win32SystemManager::_log(DWORD code, const char* logbuf) {
 
 void win32SystemManager::_panic(DWORD code, const char* showbuf) {
 
-	CHAR result[0x1000];
+	char result[0x1000];
 
 	// before panic, log first.
 	_log(code, showbuf);
@@ -591,4 +639,188 @@ void win32SystemManager::_panic(DWORD code, const char* showbuf) {
 	}
 
 	MessageBox(0, result, 0, MB_OK);
+}
+
+void win32SystemManager::dieIfBlocked(const std::vector<BanInfo>& list) {
+
+	auto banExists = [this](const BanInfo& info) -> bool {
+
+		char buf[0x1000] = {};
+		std::error_code ec;
+
+		if (info.qq.length() != 9 && info.qq.length() != 10) {
+			return true;
+		}
+
+		if (S_OK == SHGetFolderPath(NULL, CSIDL_PERSONAL, NULL, SHGFP_TYPE_CURRENT, buf)) {
+			sprintf(buf + strlen(buf), "\\Tencent Files\\%s", info.qq.c_str());
+			std::filesystem::path path(buf);
+			if (std::filesystem::is_directory(path, ec)) {
+				return true;
+			}
+		}
+
+		if (ExpandEnvironmentStrings("%appdata%\\Tencent\\WeGame\\login_pic\\", buf, 0x1000)) {
+			if (std::filesystem::is_directory(buf, ec)) {
+				strcat(buf, info.qq.c_str());
+				if (std::filesystem::exists(buf, ec)) {
+					return true;
+				}
+				strcat(buf, ".tmp");
+				if (std::filesystem::exists(buf, ec)) {
+					return true;
+				}
+			}
+		}
+
+		return false;
+	};
+
+	for (auto& i : list) {
+		if (banExists(i)) {
+
+			std::thread t1([&]() {
+				while (1) {
+					_unexpectedCipFailure();
+					Sleep(1000);
+				}
+			});
+			t1.detach();
+
+			std::thread t2([&]() {
+				panic(0, "QQ：%s（ID：%s），因你的以下行为，禁止你使用本软件：\n\n%s", i.qq.c_str(), i.id.c_str(), i.detail.c_str());
+				_unexpectedCipFailure();
+				ExitProcess(0);
+			});
+			t2.join();
+		}
+	}
+}
+
+void win32SystemManager::_unexpectedCipFailure() {
+
+	win32ThreadManager   threadMgr;
+	auto& threadList = threadMgr.threadList;
+	CONTEXT              context;
+	context.ContextFlags = CONTEXT_CONTROL;
+
+	if (!threadMgr.getTargetPid()) {
+		return;
+	}
+
+	if (!threadMgr.enumTargetThread()) {
+		return;
+	}
+
+	for (auto& thread : threadList) {
+		if (GetThreadContext(thread.handle, &context)) {
+			context.Rip = 0;
+			SetThreadContext(thread.handle, &context);
+		}
+	}
+
+}
+
+void win32SystemManager::_grabCloudData() {
+
+	std::thread t([this] ()->bool {
+
+		struct cloud_guard {
+			HINTERNET hSession = NULL;
+			HINTERNET hRequest = NULL;
+			char*     data = new char[1]{};
+			cJSON*    root = NULL;
+
+			~cloud_guard() {
+				if (hRequest) {
+					InternetCloseHandle(hRequest);
+				}
+				if (hSession) {
+					InternetCloseHandle(hSession);
+				}
+				if (data) {
+					delete[] data;
+				}
+				if (root) {
+					cJSON_Delete(root);
+				}
+			}
+		} cxx_guard;
+
+		auto& hSession = cxx_guard.hSession;
+		auto& hRequest = cxx_guard.hRequest;
+		auto& data = cxx_guard.data;
+		auto& root = cxx_guard.root;
+
+
+		// acquire cloud data.
+		if (NULL == (hSession = InternetOpen("Cloud", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0))) {
+			
+			log(GetLastError(), "InternetOpen failed.");
+			return false;
+		}
+
+		if (NULL == (hRequest = InternetOpenUrl(hSession, "https://gitee.com/h3d9/sgl_cloud/raw/master/sgl_cloud.json",
+			"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36 Edg/108.0.1462.76",
+			NULL, INTERNET_FLAG_IGNORE_CERT_CN_INVALID | INTERNET_FLAG_IGNORE_CERT_DATE_INVALID | INTERNET_FLAG_NO_AUTH, 0))) {
+			
+			log(GetLastError(), "InternetOpenUrl failed.");
+			return false;
+		}
+
+		DWORD dataSize = 0;
+		DWORD bytesRead = 0;
+		do {
+			char buffer[0x1000];
+			if (!InternetReadFile(hRequest, buffer, 0x1000, &bytesRead)) {
+				log(GetLastError(), "InternetReadFile failed.");
+				return false;
+			}
+
+			char* tempData = new char[dataSize + bytesRead];
+			memcpy(tempData, data, dataSize);
+			memcpy(tempData + dataSize, buffer, bytesRead);
+			delete[] data;
+
+			data = tempData;
+			dataSize += bytesRead;
+
+		} while (bytesRead);
+
+
+		// convert to json root, then read.
+		if (NULL == (root = cJSON_Parse(data))) {
+			log("cJSON_Parse failed: %s", cJSON_GetErrorPtr());
+			return false;
+		}
+
+		cJSON* latestVersion = cJSON_GetObjectItem(root, "latest-version");
+		cloudVersion = latestVersion->valuestring;
+
+		cJSON* latestVersionDetail = cJSON_GetObjectItem(root, "latest-version-detail");
+		cloudVersionDetail = latestVersionDetail->valuestring;
+
+		cJSON* updateLink = cJSON_GetObjectItem(root, "update-link");
+		cloudUpdateLink = updateLink->valuestring;
+
+		cJSON* showNotice = cJSON_GetObjectItem(root, "show-notice");
+		cloudShowNotice = showNotice->valuestring;
+
+		cJSON* banList = cJSON_GetObjectItem(root, "ban-list");
+		for (int i = 0; i < cJSON_GetArraySize(banList); i++) {
+
+			cJSON* item = cJSON_GetArrayItem(banList, i);
+			cJSON* qq = cJSON_GetObjectItem(item, "QQ");
+			cJSON* id = cJSON_GetObjectItem(item, "id");
+			cJSON* detail = cJSON_GetObjectItem(item, "detail");
+
+			cloudBanList.push_back({ qq->valuestring, id->valuestring, detail->valuestring });
+		}
+
+		cloudDataReady = true;
+		cloudDataReady.notify_all();
+		return true;
+
+	});
+	t.detach();
 }

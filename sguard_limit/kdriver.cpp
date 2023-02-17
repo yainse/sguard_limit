@@ -1,15 +1,21 @@
 #include <Windows.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <filesystem>
 #include "kdriver.h"
 
 
-// kernel-mode memory io
+#define DRIVER_NAME       "sguard_limit"
+#define DRIVER_VERSION    "22.11.6"
+
+
+// kernel mode memory operation
 KernelDriver  KernelDriver::kernelDriver;
 
 KernelDriver::KernelDriver()
-	: driverReady(false), sysfile{}, hSCManager(NULL), hService(NULL), hDriver(INVALID_HANDLE_VALUE),
-	  errorMessage_ptr(new CHAR[1024]), errorCode(0), errorMessage(NULL) {
+	: driverReady(false), win11ForceEnable(false), win11CurrentBuild(0),
+	  sysfile{}, hDriver(INVALID_HANDLE_VALUE), loadCount{0}, loadLock{},
+	  errorMessage_ptr(new char[0x1000]), errorCode(0), errorMessage(NULL) {
 	errorMessage = errorMessage_ptr.get();
 }
 
@@ -21,12 +27,49 @@ KernelDriver& KernelDriver::getInstance() {
 	return kernelDriver;
 }
 
-bool KernelDriver::init(const std::string& sysfileDir) {
+bool KernelDriver::init(std::string loadPath) {
 
 	_resetError();
 
-	sysfile = sysfileDir + "\\SGuardLimit_VMIO.sys";
 
+	// initialize load path and current path.
+	sysfile = loadPath + "\\" DRIVER_NAME ".sys";
+
+	char sysfile_CurPath[0x1000] = {};
+	GetModuleFileName(NULL, sysfile_CurPath, 0x1000);
+
+	if (auto p = strrchr(sysfile_CurPath, '\\')) {
+		*p = '\0';
+		strcat(sysfile_CurPath, "\\" DRIVER_NAME ".sys");
+
+	} else {
+		_recordError(0, __FUNCTION__ "(): 获取当前目录失败");
+		return false;
+	}
+
+
+	// if found sys in current path, move it to load path.
+	std::error_code ec;
+	auto getSolution = [&]() -> std::string {
+		char buf[0x1000];
+		sprintf(buf, "【解决办法】右键菜单->其他选项->打开系统用户目录，把压缩包里的sys文件手动放到这里。限制器目录若有sys文件则删掉。\n"
+			"若还不行：先禁用defender，把限制器目录以及以下2个路径加入杀毒信任区，然后重试：\n\n1. %s\n2. %s\n\n【注意】请仔细阅读附带的常见问题文档或群公告。",
+			sysfile_CurPath, sysfile.c_str());
+		return buf;
+	};
+
+	if (std::filesystem::exists(sysfile_CurPath, ec)) {
+		if (!MoveFileEx(sysfile_CurPath, sysfile.c_str(), MOVEFILE_COPY_ALLOWED | MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+			_recordError(GetLastError(), __FUNCTION__ "(): 无法移动sys文件到系统用户目录。\n\n%s", getSolution().c_str());
+			return false;
+		}
+	}
+
+	if (!std::filesystem::exists(sysfile, ec)) {
+		_recordError(0, __FUNCTION__ "(): 找不到sys文件：“" DRIVER_NAME ".sys”。\n\n%s", getSolution().c_str());
+		return false;
+	}
+	
 
 	// import certificate key.
 	HKEY       key;
@@ -120,46 +163,23 @@ bool KernelDriver::init(const std::string& sysfileDir) {
 	}
 
 	if (status != ERROR_SUCCESS) {
-		if (IDYES == MessageBox(NULL, "创建注册表项失败，你可能需要手动安装证书。\n要打开证书下载页面么？", "注意", MB_YESNO)) {
-			ShellExecute(0, "open", "https://bbs.colg.cn/thread-8305966-1-1.html", 0, 0, SW_SHOW);
+		if (IDYES == MessageBox(NULL, __FUNCTION__ "(): 创建注册表项失败，你可能需要手动安装证书。\n要打开证书下载页面么？", "注意", MB_YESNO)) {
+			ShellExecute(0, "open", "https://pan.baidu.com/s/1wAShvyh1Qff7t7VgrY7MXg?pwd=si6r", 0, 0, SW_SHOW);
 		}
 	}
 
 
-	// copy sys file to profile dir (if file exists).
-	auto     sysfilePath    = sysfile.c_str();
-	auto     currentPath    = ".\\SGuardLimit_VMIO.sys";
-	FILE*    fp;
-
-	fp = fopen(currentPath, "rb");
-
-	if (fp != NULL) {
-		fclose(fp);
-		if (!CopyFile(currentPath, sysfilePath, FALSE)) {
-			_recordError(0, "拷贝文件失败：SGuardLimit_VMIO.sys，与之相关的模块将无法使用。\n"
-				            "你可以把附带的sys文件“剪切”到以下路径：\n\n%s", sysfileDir.c_str());
-			return driverReady = false;
-		} else {
-			DeleteFile(currentPath);
-		}
-	}
-
-	fp = fopen(sysfilePath, "rb");
-
-	if (fp == NULL) {
-		_recordError(0, "找不到文件：SGuardLimit_VMIO.sys，与之相关的模块将无法使用。\n"
-			            "你可以把附带的sys文件“剪切”到以下路径：\n\n%s", sysfileDir.c_str());
-		return driverReady = false;
-	} else {
-		fclose(fp);
-	}
-
-	return driverReady = true;
+	// make sysfile ready to use.
+	return driverReady = _checkSysVersion();
 }
+
 
 bool KernelDriver::load() {
 
+	std::lock_guard<std::mutex> cxx_guard(loadLock);
+	
 	_resetError();
+
 
 	if (hDriver == INVALID_HANDLE_VALUE) {
 
@@ -167,27 +187,32 @@ bool KernelDriver::load() {
 			return false;
 		}
 
-		hDriver = CreateFile("\\\\.\\SGuardLimit_VMIO", GENERIC_ALL, FILE_SHARE_READ | FILE_SHARE_WRITE, 0, OPEN_EXISTING, 0, 0);
-		
+		hDriver = CreateFile("\\\\.\\" DRIVER_NAME, GENERIC_ALL, FILE_SHARE_READ | FILE_SHARE_WRITE, 0, OPEN_EXISTING, 0, 0);
+
 		if (hDriver == INVALID_HANDLE_VALUE) {
-			_recordError(GetLastError(), "CreateFile失败。");
+			_recordError(GetLastError(), __FUNCTION__ "(): CreateFile失败。");
 			return false;
 		}
 	}
 
+
+	loadCount++;  // loadCount > 0 is guarenteed if driver load success.
 	return true;
 }
 
 void KernelDriver::unload() {
 
-	_resetError();
+	std::lock_guard<std::mutex> cxx_guard(loadLock);
 
-	if (hDriver != INVALID_HANDLE_VALUE) {
 
-		CloseHandle(hDriver);
-		hDriver = INVALID_HANDLE_VALUE;
+	if (loadCount > 0) {  // loadCount > 0 is guarenteed if driver load success.
+		loadCount--;
 
-		_endService();
+		if (loadCount == 0) {
+			CloseHandle(hDriver);
+			hDriver = INVALID_HANDLE_VALUE;
+			_endService();
+		}
 	}
 }
 
@@ -200,22 +225,16 @@ bool KernelDriver::readVM(DWORD pid, PVOID out, PVOID targetAddress) {
 	_resetError();
 
 
-	if ((ULONG64)targetAddress & ((ULONG64)0xffff << 48)) { // mask: 0xFFFF...is kernel space. (win7=0xfffff...)
-		_recordError(0, "driver::readVM(): 无效的虚拟地址：0x%llx。", targetAddress);
-		return false;
-	}
-
-
 	for (auto page = 0; page < 4; page++) {
 
 		request.address = (PVOID)((ULONG64)targetAddress + page * 0x1000);
 
 		if (!DeviceIoControl(hDriver, VMIO_READ, &request, sizeof(request), &request, sizeof(request), &Bytes, NULL)) {
-			_recordError(GetLastError(), "driver::readVM(): DeviceIoControl失败。");
+			_recordError(GetLastError(), __FUNCTION__ "(): DeviceIoControl失败。");
 			return false;
 		}
 		if (request.errorCode != 0) {
-			_recordError(request.errorCode, "kernelDriver: %s", request.errorFunc);
+			_recordError(request.errorCode, "%s", request.errorFunc);
 			return false;
 		}
 
@@ -234,12 +253,6 @@ bool KernelDriver::writeVM(DWORD pid, PVOID in, PVOID targetAddress) {
 	_resetError();
 
 
-	if ((ULONG64)targetAddress & ((ULONG64)0xffff << 48)) {
-		_recordError(0, "driver::writeVM(): 无效的虚拟地址：0x%llx。", targetAddress);
-		return false;
-	}
-
-
 	for (auto page = 0; page < 4; page++) {
 
 		request.address = (PVOID)((ULONG64)targetAddress + page * 0x1000);
@@ -247,11 +260,11 @@ bool KernelDriver::writeVM(DWORD pid, PVOID in, PVOID targetAddress) {
 		memcpy(request.data, (PVOID)((ULONG64)in + page * 0x1000), 0x1000);
 
 		if (!DeviceIoControl(hDriver, VMIO_WRITE, &request, sizeof(request), &request, sizeof(request), &Bytes, NULL)) {
-			_recordError(GetLastError(), "driver::writeVM(): DeviceIoControl失败。");
+			_recordError(GetLastError(), __FUNCTION__ "(): DeviceIoControl失败。");
 			return false;
 		}
 		if (request.errorCode != 0) {
-			_recordError(request.errorCode, "kernelDriver: %s", request.errorFunc);
+			_recordError(request.errorCode, "%s", request.errorFunc);
 			return false;
 		}
 	}
@@ -268,11 +281,11 @@ bool KernelDriver::allocVM(DWORD pid, PVOID* pAllocatedAddress) {
 
 
 	if (!DeviceIoControl(hDriver, VMIO_ALLOC, &request, sizeof(request), &request, sizeof(request), &Bytes, NULL)) {
-		_recordError(GetLastError(), "driver::allocVM(): DeviceIoControl失败。");
+		_recordError(GetLastError(), __FUNCTION__ "(): DeviceIoControl失败。");
 		return false;
 	}
 	if (request.errorCode != 0) {
-		_recordError(request.errorCode, "kernelDriver: %s", request.errorFunc);
+		_recordError(request.errorCode, "%s", request.errorFunc);
 		return false;
 	}
 
@@ -290,11 +303,11 @@ bool KernelDriver::suspend(DWORD pid) {
 
 
 	if (!DeviceIoControl(hDriver, IO_SUSPEND, &request, sizeof(request), &request, sizeof(request), &Bytes, NULL)) {
-		_recordError(GetLastError(), "driver::suspend(): DeviceIoControl失败。");
+		_recordError(GetLastError(), __FUNCTION__ "(): DeviceIoControl失败。");
 		return false;
 	}
 	if (request.errorCode != 0) {
-		_recordError(request.errorCode, "kernelDriver: %s", request.errorFunc);
+		_recordError(request.errorCode, "%s", request.errorFunc);
 		return false;
 	}
 
@@ -310,11 +323,11 @@ bool KernelDriver::resume(DWORD pid) {
 
 
 	if (!DeviceIoControl(hDriver, IO_RESUME, &request, sizeof(request), &request, sizeof(request), &Bytes, NULL)) {
-		_recordError(GetLastError(), "driver::resume(): DeviceIoControl失败。");
+		_recordError(GetLastError(), __FUNCTION__ "(): DeviceIoControl失败。");
 		return false;
 	}
 	if (request.errorCode != 0) {
-		_recordError(request.errorCode, "kernelDriver: %s", request.errorFunc);
+		_recordError(request.errorCode, "%s", request.errorFunc);
 		return false;
 	}
 
@@ -332,11 +345,11 @@ bool KernelDriver::searchVad(DWORD pid, std::vector<ULONG64>& out, const wchar_t
 	wcscpy((wchar_t*)request.data, moduleName);  // [io param] moduleName => (wchar_t*)request.data
 
 	if (!DeviceIoControl(hDriver, VM_VADSEARCH, &request, sizeof(request), &request, sizeof(request), &Bytes, NULL)) {
-		_recordError(GetLastError(), "driver::searchVad(): DeviceIoControl失败。");
+		_recordError(GetLastError(), __FUNCTION__ "(): DeviceIoControl失败。");
 		return false;
 	}
 	if (request.errorCode != 0) {
-		_recordError(request.errorCode, "kernelDriver: %s", request.errorFunc);
+		_recordError(request.errorCode, "%s", request.errorFunc);
 		return false;
 	}
 
@@ -354,55 +367,85 @@ bool KernelDriver::searchVad(DWORD pid, std::vector<ULONG64>& out, const wchar_t
 	return true;
 }
 
-#define SVC_ERROR_EXIT(errorCode, errorMsg)   _recordError(errorCode, errorMsg); \
-                                              if (hService) CloseServiceHandle(hService); \
-                                              if (hSCManager) CloseServiceHandle(hSCManager); \
-                                              hService = NULL; \
-                                              hSCManager = NULL; \
-                                              return false;
+bool KernelDriver::restoreVad() {
+
+	VMIO_REQUEST  request(0);
+	DWORD         Bytes;
+
+	_resetError();
+
+
+	if (!DeviceIoControl(hDriver, VM_VADRESTORE, &request, sizeof(request), &request, sizeof(request), &Bytes, NULL)) {
+		_recordError(GetLastError(), __FUNCTION__ "(): DeviceIoControl失败。");
+		return false;
+	}
+	
+	return true;
+}
+
+bool KernelDriver::patchAceBase() {
+
+	VMIO_REQUEST  request(0);
+	DWORD         Bytes;
+
+	_resetError();
+
+
+	*(int*)request.data = ~1;
+
+	if (!DeviceIoControl(hDriver, PATCH_ACEBASE, &request, sizeof(request), &request, sizeof(request), &Bytes, NULL)) {
+		_recordError(GetLastError(), __FUNCTION__ "(): DeviceIoControl失败。");
+		return false;
+	}
+	if (request.errorCode != 0) {
+		_recordError(request.errorCode, "data_hijack: %s", request.errorFunc);
+		return false;
+	}
+
+	return true;
+}
+
 
 bool KernelDriver::_startService() {
 
+	service_guard  cxx_guard;
+	auto&          hSCManager  = cxx_guard.hSCManager;
+	auto&          hService    = cxx_guard.hService;
 	SERVICE_STATUS svcStatus;
+
 
 	// open SCM.
 	hSCManager = OpenSCManager(NULL, NULL, SC_MANAGER_ALL_ACCESS);
-
 	if (!hSCManager) {
-		SVC_ERROR_EXIT(GetLastError(), "OpenSCManager失败。");
+		_recordError(GetLastError(), "OpenSCManager失败。");
+		return false;
 	}
 
 	// open Service.
-	hService = OpenService(hSCManager, "SGuardLimit_VMIO", SERVICE_ALL_ACCESS);
-
+	hService = OpenService(hSCManager, DRIVER_NAME, SERVICE_ALL_ACCESS);
 	if (!hService) {
-		hService = 
-		CreateService(hSCManager, "SGuardLimit_VMIO", "SGuardLimit_VMIO",
+
+		hService = CreateService(hSCManager, DRIVER_NAME, DRIVER_NAME,
 			SERVICE_ALL_ACCESS, SERVICE_KERNEL_DRIVER, SERVICE_DEMAND_START, SERVICE_ERROR_NORMAL,
-			sysfile.c_str(),  /* no quote here, msdn e.g. is wrong */ /* assert path is valid */
-			NULL, NULL, NULL, NULL, NULL);
+			sysfile.c_str() /* no quote */ , NULL, NULL, NULL, NULL, NULL);
 
 		if (!hService) {
-			SVC_ERROR_EXIT(GetLastError(), "CreateService失败。");
+			_recordError(GetLastError(), "CreateService失败。");
+			return false;
 		}
 	}
 
-	// check service status. (return val is ignored here)
+	// check service status.
 	(void)QueryServiceStatus(hService, &svcStatus);
 
-	// if service is running, stop it.
-	if (svcStatus.dwCurrentState != SERVICE_STOPPED && svcStatus.dwCurrentState != SERVICE_STOP_PENDING) {
-		if (!ControlService(hService, SERVICE_CONTROL_STOP, &svcStatus)) {
-			DWORD errorCode = GetLastError();
-			DeleteService(hService);
-			SVC_ERROR_EXIT(errorCode, "无法停止当前服务。重启电脑应该能解决该问题。");
-		}
+	// if service is running, return true to use it directly.
+	if (svcStatus.dwCurrentState == SERVICE_RUNNING) {
+		return true;
 	}
 
-	// if service is stopping,
-	// wait till it's completely stopped. 
+	// if service is stopping, wait till it's completely stopped. timeout: 3s
 	if (svcStatus.dwCurrentState == SERVICE_STOP_PENDING) {
-		for (auto time = 0; time < 50; time++) {
+		for (auto time = 0; time < 30; time++) {
 			Sleep(100);
 			(void)QueryServiceStatus(hService, &svcStatus);
 			if (svcStatus.dwCurrentState == SERVICE_STOPPED) {
@@ -411,17 +454,17 @@ bool KernelDriver::_startService() {
 		}
 
 		if (svcStatus.dwCurrentState == SERVICE_STOP_PENDING) {
+			_recordError(0, "等待服务停止所花费的时间过长，建议重启电脑。");
 			DeleteService(hService);
-			SVC_ERROR_EXIT(0, "停止当前服务时的等待时间过长。重启电脑应该能解决该问题。");
+			return false;
 		}
 	}
 
 	// start service.
-	// if start failed, delete old one (cause old service may have wrong params)
 	if (!StartService(hService, 0, NULL)) {
-		DWORD errorCode = GetLastError();
+		_recordError(GetLastError(), "StartService失败。建议重启电脑。\n\n【注意】请仔细阅读附带的常见问题文档或群公告。");
 		DeleteService(hService);
-		SVC_ERROR_EXIT(errorCode, "StartService失败。重启电脑应该能解决该问题。");
+		return false;
 	}
 
 	return true;
@@ -429,7 +472,22 @@ bool KernelDriver::_startService() {
 
 void KernelDriver::_endService() {
 
+	service_guard  cxx_guard;
+	auto&          hSCManager  = cxx_guard.hSCManager;
+	auto&          hService    = cxx_guard.hService;
 	SERVICE_STATUS svcStatus;
+
+	// open SCM.
+	hSCManager = OpenSCManager(NULL, NULL, SC_MANAGER_ALL_ACCESS);
+	if (!hSCManager) {
+		return;
+	}
+
+	// open Service.
+	hService = OpenService(hSCManager, DRIVER_NAME, SERVICE_ALL_ACCESS);
+	if (!hService) {
+		return;
+	}
 
 	// stop service.
 	ControlService(hService, SERVICE_CONTROL_STOP, &svcStatus);
@@ -438,10 +496,38 @@ void KernelDriver::_endService() {
 	DeleteService(hService);
 
 	// service will be deleted after we close service handle.
-	CloseServiceHandle(hService);
-	CloseServiceHandle(hSCManager);
-	hService = NULL;
-	hSCManager = NULL;
+}
+
+
+bool KernelDriver::_checkSysVersion() {
+
+	// determine whether sysfile version matches.
+	// this function don't need load() & unload(). caller should call this directly.
+
+	_resetError();
+
+	VMIO_REQUEST  request(0);
+	DWORD         Bytes;
+
+	if (!this->load()) {
+		return false;
+	}
+
+	if (!DeviceIoControl(hDriver, VMIO_VERSION, &request, sizeof(request), &request, sizeof(request), &Bytes, NULL)) {
+		_recordError(GetLastError(), "driver::_checkSysVersion(): DeviceIoControl失败。");
+		this->unload();
+		return false;
+	}
+
+	this->unload();
+
+	if (0 != strcmp(request.data, DRIVER_VERSION)) {
+		_recordError(0, "driver::checkSysVersion(): 内核驱动文件“" DRIVER_NAME ".sys”不是最新的。\n\n"
+			"【提示】需要把限制器和附带的sys文件解压到一起再运行，不要直接在压缩包里点开。");
+		return false;
+	}
+
+	return true;
 }
 
 void KernelDriver::_resetError() {
@@ -449,7 +535,7 @@ void KernelDriver::_resetError() {
 	errorMessage_ptr.get()[0] = '\0';
 }
 
-void KernelDriver::_recordError(DWORD errorCode, const CHAR* msg, ...) {
+void KernelDriver::_recordError(DWORD errorCode, const char* msg, ...) {
 	
 	this->errorCode = errorCode;
 	
